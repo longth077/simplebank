@@ -1,0 +1,98 @@
+name: CI/CD – Build & Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # Required for OIDC (Federated Identity)
+  contents: read
+
+env:
+  ACR_NAME: mysimplebankacr
+  AZURE_CONTAINER_REGISTRY: mysimplebankacr.azurecr.io
+  IMAGE_NAME: simplebank
+  CONTAINER_APP_NAME: simplebank-app
+  RESOURCE_GROUP: simplebank-rg
+  KEY_VAULT_NAME: simplebank-kv
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ──────────────────────────────────────────
+      # 1. Checkout source code
+      # ──────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────
+      # 2. Authenticate to Azure via OIDC (No stored passwords!)
+      # ──────────────────────────────────────────
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ──────────────────────────────────────────
+      # 3. Fetch Secrets from Azure Key Vault
+      # ──────────────────────────────────────────
+      - name: Get Secrets from Key Vault
+        uses: azure/get-keyvault-secrets@v1
+        with:
+          keyvault: ${{ env.KEY_VAULT_NAME }}
+          secrets: "DB-CONNECTION-STRING, DB-PASSWORD, TOKEN-SYMMETRIC-KEY"
+        id: kv-secrets
+
+      # ──────────────────────────────────────────
+      # 4. Set up Go
+      # ──────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # ──────────────────────────────────────────
+      # 5. Run Tests
+      # ──────────────────────────────────────────
+      - name: Run Tests
+        run: go test ./...
+
+      # ──────────────────────────────────────────
+      # 6. Build Docker Image
+      # ──────────────────────────────────────────
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      # ──────────────────────────────────────────
+      # 7. Login & Push to Azure Container Registry
+      # ──────────────────────────────────────────
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Push Image to ACR
+        run: |
+          docker push ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # ──────────────────────────────────────────
+      # 8. Deploy to Azure Container Apps
+      # ──────────────────────────────────────────
+      - name: Deploy to Azure Container Apps
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --set-env-vars \
+              DB_CONNECTION_STRING="${{ steps.kv-secrets.outputs.DB-CONNECTION-STRING }}" \
+              DB_PASSWORD="${{ steps.kv-secrets.outputs.DB-PASSWORD }}" \
+              TOKEN_SYMMETRIC_KEY="${{ steps.kv-secrets.outputs.TOKEN-SYMMETRIC-KEY }}"
